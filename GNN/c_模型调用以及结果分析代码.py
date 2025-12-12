@@ -50,6 +50,29 @@ class ModelPredictor:
         filename : str
             模型文件名
         """
+        # 检查模型文件是否存在
+        model_path = os.path.join(self.model_dir, filename)
+        if not os.path.exists(model_path):
+            # 尝试加载最佳模型
+            best_model_path = os.path.join(self.model_dir, 'gnn_model_best.pth')
+            if os.path.exists(best_model_path):
+                print(f"未找到 {filename}，尝试加载最佳模型: gnn_model_best.pth")
+                filename = 'gnn_model_best.pth'
+            else:
+                print("=" * 60)
+                print("❌ 错误：模型文件不存在！")
+                print("=" * 60)
+                print(f"\n未找到模型文件: {model_path}")
+                print(f"也未找到最佳模型: {best_model_path}")
+                print("\n💡 解决方案：")
+                print("   请先运行训练代码生成模型文件：")
+                print("   python GNN/b_模型训练代码.py")
+                print("\n   训练完成后会生成以下文件：")
+                print("   - model/gnn_model.pth (最终模型)")
+                print("   - model/gnn_model_best.pth (最佳模型)")
+                print("=" * 60)
+                raise FileNotFoundError(f"模型文件不存在: {model_path}\n请先运行训练代码: python GNN/b_模型训练代码.py")
+        
         self.trainer.load_model(filename)
         print(f"模型类型: GNN ({self.trainer.model_type})")
         if self.trainer.classes is not None:
@@ -350,8 +373,17 @@ def main():
         output_dir='results/'
     )
     
-    # 加载模型
-    predictor.load_model('gnn_model.pth')
+    # 加载模型（尝试加载最佳模型，如果不存在则加载普通模型）
+    try:
+        predictor.load_model('gnn_model.pth')
+    except FileNotFoundError:
+        # 如果普通模型不存在，尝试加载最佳模型
+        try:
+            predictor.load_model('gnn_model_best.pth')
+        except FileNotFoundError:
+            # 如果都不存在，给出提示并退出
+            print("\n请先运行训练代码生成模型文件！")
+            return
     
     # 预测测试数据
     test_file_path = 'train/清洗测试数据.csv'
