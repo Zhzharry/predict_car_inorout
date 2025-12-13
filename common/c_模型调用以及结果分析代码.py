@@ -115,8 +115,8 @@ class ModelPredictor:
         # QR特征筛选
         X_selected = self.trainer.apply_qr_selection(X_reduced)
         
-        # 预测（使用阈值调整）
-        predictions = self.trainer.predict(X_selected, use_threshold=use_threshold)
+        # 预测（优化：使用类别权重以提升准确率，不使用阈值避免预测全为零）
+        predictions = self.trainer.predict(X_selected, use_threshold=False, use_class_weight=True)
         return predictions
     
     def predict_test_file(self, cleaned_test_path='train/清洗测试数据.csv', 
@@ -157,10 +157,14 @@ class ModelPredictor:
         else:
             X_test = df_test[feature_cols].copy()
         
-        # 预测
-        print("正在预测...")
+        # 预测（优化：使用类别权重，应用时序平滑）
+        print("正在预测（优化版）...")
         start_time = time.time()
-        predictions = self.predict_batch(X_test.values)
+        predictions = self.predict_batch(X_test.values, use_threshold=False)
+        
+        # 应用适度的时序平滑以提升稳定性
+        predictions = self.trainer.temporal_smoothing(predictions, window_size=9)
+        
         predict_time = time.time() - start_time
         
         print(f"预测完成，耗时: {predict_time:.2f} 秒")
@@ -212,8 +216,11 @@ class ModelPredictor:
                     # 2. 使用DataCleaner进行预处理
                     processed_test_df = self.cleaner.process_test_data(original_test_df.copy())
                     
-                    # 3. 进行预测
-                    predictions = self.predict_batch(processed_test_df)
+                    # 3. 进行预测（优化：使用类别权重，应用时序平滑）
+                    predictions = self.predict_batch(processed_test_df, use_threshold=False)
+                    
+                    # 应用适度的时序平滑以提升稳定性
+                    predictions = self.trainer.temporal_smoothing(predictions, window_size=9)
                     
                     # 4. 将预测结果添加到原始DataFrame
                     original_test_df['labelArea'] = predictions

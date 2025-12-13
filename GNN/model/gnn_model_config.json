@@ -1,0 +1,26 @@
+{
+    "model_type": "GNN",
+    "gnn_type": "GCN",
+    "input_dim": 1,
+    "hidden_dim": 32,
+    "output_dim": 3,
+    "learning_rate": 0.0005,
+    "batch_size": 8,
+    "window_size": 25,
+    "svd_ratio": 0.95,
+    "qr_threshold": 0.1,
+    "classes": [
+        0,
+        1,
+        2
+    ],
+    "class_weights": {
+        "0": 0.3596602374583509,
+        "1": 8.809195402298851,
+        "2": 9.426814268142682
+    },
+    "total_params": 163,
+    "training_info": {
+        "timestamp": "2025-12-12 22:35:54"
+    }
+}

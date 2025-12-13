@@ -118,7 +118,13 @@ class ModelPredictor:
         with torch.no_grad():
             batch = Batch.from_data_list([graph])
             out = self.trainer.model(batch.x, batch.edge_index, batch.batch)
-            prediction = out.argmax(dim=1).item()
+            pred_idx = out.argmax(dim=1).item()
+            
+            # 将模型输出的索引映射回原始类别标签
+            if self.trainer.classes is not None:
+                prediction = int(self.trainer.classes[pred_idx])
+            else:
+                prediction = pred_idx
         
         return prediction
     
@@ -155,7 +161,15 @@ class ModelPredictor:
                 batch_graphs = graphs[i:i+self.trainer.batch_size]
                 batch = Batch.from_data_list(batch_graphs)
                 out = self.trainer.model(batch.x, batch.edge_index, batch.batch)
-                pred = out.argmax(dim=1).cpu().numpy()
+                pred_idx = out.argmax(dim=1).cpu().numpy()
+                
+                # 将模型输出的索引映射回原始类别标签
+                if self.trainer.classes is not None:
+                    # classes是按顺序排列的，pred_idx是索引，直接映射
+                    pred = self.trainer.classes[pred_idx]
+                else:
+                    pred = pred_idx
+                
                 predictions.extend(pred)
         
         # 将预测结果映射回原始样本

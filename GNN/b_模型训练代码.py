@@ -285,10 +285,21 @@ class GraphBuilder:
             edge_index = np.array([[i, i] for i in range(n_nodes)], dtype=np.int64).T
             edge_attr = np.ones(n_nodes, dtype=np.float32)
         
+        # 检查并清理 NaN/Inf
+        if np.isnan(node_features).any() or np.isinf(node_features).any():
+            node_features = np.nan_to_num(node_features, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        if np.isnan(edge_attr).any() or np.isinf(edge_attr).any():
+            edge_attr = np.nan_to_num(edge_attr, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         # 转换为torch tensor
         edge_index = torch.from_numpy(edge_index).long()
         edge_attr = torch.from_numpy(edge_attr).float()
         x = torch.from_numpy(node_features).float()
+        
+        # 再次检查
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
         
         # 创建图数据
         graph_data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
@@ -322,6 +333,19 @@ class LightweightGCN(nn.Module):
         self.conv1 = GCNConv(input_dim, hidden_dim)
         self.conv2 = GCNConv(hidden_dim, output_dim)
         
+        # 初始化权重（Xavier初始化，提高数值稳定性）
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """初始化模型权重"""
+        for m in self.modules():
+            if isinstance(m, GCNConv):
+                # 使用Xavier初始化
+                if hasattr(m, 'lin'):
+                    torch.nn.init.xavier_uniform_(m.lin.weight)
+                    if m.lin.bias is not None:
+                        torch.nn.init.zeros_(m.lin.bias)
+        
     def forward(self, x, edge_index, batch=None):
         """
         前向传播
@@ -340,12 +364,27 @@ class LightweightGCN(nn.Module):
         out : Tensor
             图级别输出 (n_graphs, output_dim)
         """
+        # 检查输入是否有 NaN 或 Inf
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("警告：输入包含 NaN 或 Inf，进行清理")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         # 第一层GCN + ReLU
         x = self.conv1(x, edge_index)
         x = F.relu(x)
         
+        # 检查中间结果
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("警告：第一层GCN输出包含 NaN 或 Inf")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         # 第二层GCN
         x = self.conv2(x, edge_index)
+        
+        # 检查输出
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("警告：第二层GCN输出包含 NaN 或 Inf")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
         
         # 图级别聚合：均值池化
         if batch is not None:
@@ -354,6 +393,11 @@ class LightweightGCN(nn.Module):
         else:
             # 单图情况：直接均值
             x = x.mean(dim=0, keepdim=True)
+        
+        # 最终检查
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("警告：最终输出包含 NaN 或 Inf")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
         
         return x
 
@@ -393,7 +437,7 @@ class GNNTrainer:
         self.input_dim = 1  # 节点特征维度（单维度）
         self.hidden_dim = 32
         self.output_dim = 3  # 三分类
-        self.learning_rate = 1e-4
+        self.learning_rate = 5e-4  # 适中的学习率（避免梯度爆炸）
         self.batch_size = 8
         self.epochs = 50
         
@@ -431,13 +475,24 @@ class GNNTrainer:
         graphs = []
         print(f"预计构建 {n_graphs} 个图，请稍候...")
         
+        # 创建类别到索引的映射（用于将标签映射到模型输出索引）
+        if self.classes is not None:
+            class_to_idx = {int(cls): idx for idx, cls in enumerate(sorted(self.classes))}
+        else:
+            # 如果还没有类别信息，从y中获取
+            unique_classes = np.unique(y)
+            class_to_idx = {int(cls): idx for idx, cls in enumerate(sorted(unique_classes))}
+        
         for i in range(n_graphs):
             # 提取窗口数据
             X_window = X[i:i+window_size, :]
-            y_label = y[i + window_size // 2]  # 使用窗口中心标签
+            y_label_raw = y[i + window_size // 2]  # 使用窗口中心标签
             
-            # 构建图
-            graph = self.graph_builder.build_graph(X_window, y_label)
+            # 将原始标签映射到模型输出索引
+            y_label_idx = class_to_idx[int(y_label_raw)]
+            
+            # 构建图（传入映射后的索引）
+            graph = self.graph_builder.build_graph(X_window, y_label_idx)
             graphs.append(graph)
             
             # 显示进度
@@ -472,21 +527,31 @@ class GNNTrainer:
         print("GNN模型训练")
         print("=" * 60)
         
-        # 构建图
-        train_graphs = self.build_graphs_from_data(X_train, y_train)
-        val_graphs = self.build_graphs_from_data(X_val, y_val)
-        
-        # 获取类别信息
+        # 先获取类别信息（在构建图之前）
         if hasattr(y_train, 'values'):
             y_train = y_train.values
         y_train = np.asarray(y_train)
         self.classes = np.unique(y_train)
         self.output_dim = len(self.classes)
         
+        # 创建类别到索引的映射（用于将原始标签映射到模型输出索引）
+        sorted_classes = sorted(self.classes)
+        self.class_to_idx = {int(cls): idx for idx, cls in enumerate(sorted_classes)}
+        print(f"类别映射: {self.class_to_idx}")
+        
+        # 构建图（标签会被映射到索引）
+        train_graphs = self.build_graphs_from_data(X_train, y_train)
+        val_graphs = self.build_graphs_from_data(X_val, y_val)
+        
         # 计算类别权重
         class_weights = compute_class_weight('balanced', classes=self.classes, y=y_train)
         self.class_weights = {int(cls): float(weight) for cls, weight in zip(self.classes, class_weights)}
         print(f"类别权重: {self.class_weights}")
+        
+        # 将类别权重转换为tensor（按类别顺序）
+        sorted_classes = sorted(self.classes)
+        weight_tensor = torch.FloatTensor([self.class_weights[int(cls)] for cls in sorted_classes])
+        print(f"权重tensor: {weight_tensor}")
         
         # 创建模型
         self.model = LightweightGCN(
@@ -495,9 +560,12 @@ class GNNTrainer:
             output_dim=self.output_dim
         )
         
-        # 优化器和损失函数
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        criterion = nn.CrossEntropyLoss()
+        # 优化器和损失函数（添加梯度裁剪和学习率调整，使用类别权重）
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=1e-5)
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor)  # 使用类别权重！
+        
+        # 梯度裁剪阈值
+        max_grad_norm = 1.0
         
         # 训练历史
         history = {
@@ -512,86 +580,142 @@ class GNNTrainer:
         patience_counter = 0
         
         print(f"\n开始训练（epochs={self.epochs}, batch_size={self.batch_size}）...")
+        print(f"训练图数量: {len(train_graphs)}, 验证图数量: {len(val_graphs)}")
         
-        for epoch in range(self.epochs):
-            # 训练阶段
-            self.model.train()
-            train_loss = 0.0
-            train_correct = 0
-            train_total = 0
-            
-            # 批量训练
-            for i in range(0, len(train_graphs), self.batch_size):
-                batch_graphs = train_graphs[i:i+self.batch_size]
-                batch = Batch.from_data_list(batch_graphs)
+        try:
+            for epoch in range(self.epochs):
+                # 训练阶段
+                self.model.train()
+                train_loss = 0.0
+                train_correct = 0
+                train_total = 0
                 
-                # 前向传播
-                out = self.model(batch.x, batch.edge_index, batch.batch)
-                labels = batch.y
+                n_batches = (len(train_graphs) + self.batch_size - 1) // self.batch_size
+                print(f"\nEpoch {epoch+1}/{self.epochs}: 开始训练（{n_batches} 个批次）...")
                 
-                # 计算损失
-                loss = criterion(out, labels)
+                # 批量训练
+                batch_count = 0
+                for i in range(0, len(train_graphs), self.batch_size):
+                    try:
+                        batch_graphs = train_graphs[i:i+self.batch_size]
+                        batch = Batch.from_data_list(batch_graphs)
+                        
+                        # 前向传播
+                        out = self.model(batch.x, batch.edge_index, batch.batch)
+                        labels = batch.y
+                        
+                        # 计算损失
+                        loss = criterion(out, labels)
+                        
+                        # 检查损失是否为 NaN
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f"  警告：批次 {batch_count+1} 损失为 NaN/Inf，跳过该批次")
+                            print(f"    输出范围: [{out.min().item():.4f}, {out.max().item():.4f}]")
+                            print(f"    输出包含NaN: {torch.isnan(out).any().item()}")
+                            print(f"    标签: {labels}")
+                            continue
+                        
+                        # 检查输出是否正常
+                        if torch.isnan(out).any() or torch.isinf(out).any():
+                            print(f"  警告：批次 {batch_count+1} 输出包含 NaN/Inf，跳过该批次")
+                            continue
+                        
+                        # 反向传播
+                        optimizer.zero_grad()
+                        loss.backward()
+                        
+                        # 梯度裁剪（防止梯度爆炸）
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+                        
+                        optimizer.step()
+                        
+                        train_loss += loss.item()
+                        pred = out.argmax(dim=1)
+                        train_correct += (pred == labels).sum().item()
+                        train_total += len(labels)
+                        
+                        batch_count += 1
+                        # 每10个batch打印一次进度
+                        if batch_count % 10 == 0:
+                            print(f"  批次 {batch_count}/{n_batches}, 当前损失: {loss.item():.4f}")
+                    except Exception as e:
+                        print(f"  错误：处理批次 {batch_count+1} 时出错: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        raise
+            
+                avg_train_loss = train_loss / max(batch_count, 1)
+                train_acc = train_correct / train_total if train_total > 0 else 0.0
                 
-                # 反向传播
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                print(f"  训练完成: Loss={avg_train_loss:.4f}, Acc={train_acc:.4f}")
                 
-                train_loss += loss.item()
-                pred = out.argmax(dim=1)
-                train_correct += (pred == labels).sum().item()
-                train_total += len(labels)
+                # 验证阶段
+                self.model.eval()
+                val_loss = 0.0
+                val_correct = 0
+                val_total = 0
+                
+                val_n_batches = (len(val_graphs) + self.batch_size - 1) // self.batch_size
+                print(f"  开始验证（{val_n_batches} 个批次）...")
+                
+                with torch.no_grad():
+                    val_batch_count = 0
+                    for i in range(0, len(val_graphs), self.batch_size):
+                        try:
+                            batch_graphs = val_graphs[i:i+self.batch_size]
+                            batch = Batch.from_data_list(batch_graphs)
+                            
+                            out = self.model(batch.x, batch.edge_index, batch.batch)
+                            labels = batch.y
+                            
+                            loss = criterion(out, labels)
+                            val_loss += loss.item()
+                            
+                            pred = out.argmax(dim=1)
+                            val_correct += (pred == labels).sum().item()
+                            val_total += len(labels)
+                            
+                            val_batch_count += 1
+                        except Exception as e:
+                            print(f"  错误：验证批次 {val_batch_count+1} 时出错: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            raise
             
-            avg_train_loss = train_loss / (len(train_graphs) // self.batch_size + 1)
-            train_acc = train_correct / train_total if train_total > 0 else 0.0
-            
-            # 验证阶段
-            self.model.eval()
-            val_loss = 0.0
-            val_correct = 0
-            val_total = 0
-            
-            with torch.no_grad():
-                for i in range(0, len(val_graphs), self.batch_size):
-                    batch_graphs = val_graphs[i:i+self.batch_size]
-                    batch = Batch.from_data_list(batch_graphs)
-                    
-                    out = self.model(batch.x, batch.edge_index, batch.batch)
-                    labels = batch.y
-                    
-                    loss = criterion(out, labels)
-                    val_loss += loss.item()
-                    
-                    pred = out.argmax(dim=1)
-                    val_correct += (pred == labels).sum().item()
-                    val_total += len(labels)
-            
-            avg_val_loss = val_loss / (len(val_graphs) // self.batch_size + 1)
-            val_acc = val_correct / val_total if val_total > 0 else 0.0
-            
-            # 记录历史
-            history['train_loss'].append(avg_train_loss)
-            history['train_acc'].append(train_acc)
-            history['val_loss'].append(avg_val_loss)
-            history['val_acc'].append(val_acc)
-            
-            # 打印进度
-            if (epoch + 1) % 5 == 0 or epoch == 0:
+                avg_val_loss = val_loss / max(val_batch_count, 1)
+                val_acc = val_correct / val_total if val_total > 0 else 0.0
+                
+                # 记录历史
+                history['train_loss'].append(avg_train_loss)
+                history['train_acc'].append(train_acc)
+                history['val_loss'].append(avg_val_loss)
+                history['val_acc'].append(val_acc)
+                
+                # 打印进度（每个epoch都打印）
                 print(f"Epoch {epoch+1}/{self.epochs}: "
                       f"Train Loss={avg_train_loss:.4f}, Train Acc={train_acc:.4f}, "
                       f"Val Loss={avg_val_loss:.4f}, Val Acc={val_acc:.4f}")
-            
-            # Early stopping
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                patience_counter = 0
-                # 保存最佳模型
-                self.save_model('gnn_model_best.pth')
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    print(f"Early stopping at epoch {epoch+1}")
-                    break
+                
+                # Early stopping
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    patience_counter = 0
+                    print(f"  ✓ 验证准确率提升，保存最佳模型")
+                    # 保存最佳模型
+                    self.save_model('gnn_model_best.pth')
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        print(f"Early stopping at epoch {epoch+1}")
+                        break
+                    else:
+                        print(f"  验证准确率未提升 ({patience_counter}/{patience})")
+        
+        except Exception as e:
+            print(f"\n训练过程中出现错误: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
         
         print(f"\n训练完成！最佳验证准确率: {best_val_acc:.4f}")
         return history
@@ -758,6 +882,11 @@ class GNNTrainer:
         self.classes = np.array(checkpoint.get('classes')) if checkpoint.get('classes') else None
         self.class_weights = checkpoint.get('class_weights')
         
+        # 重建类别到索引的映射
+        if self.classes is not None:
+            sorted_classes = sorted(self.classes)
+            self.class_to_idx = {int(cls): idx for idx, cls in enumerate(sorted_classes)}
+        
         # 加载图构建器配置
         graph_config = checkpoint.get('graph_builder_config', {})
         self.graph_builder.window_size = graph_config.get('window_size', 25)
@@ -767,6 +896,7 @@ class GNNTrainer:
         print(f"模型已加载: {filepath}")
         if self.classes is not None:
             print(f"类别数: {len(self.classes)}")
+            print(f"类别映射: {self.class_to_idx}")
 
 
 def main():
@@ -777,7 +907,7 @@ def main():
     
     # 1. 数据清洗和预处理
     cleaner = DataCleaner(
-        train_path='train/训练数据.csv',
+        train_path='train/清洗训练数据.csv',
         test_dir='test/',
         output_dir='model/'
     )
@@ -810,75 +940,13 @@ def main():
     # 6. 保存模型
     trainer.save_model('gnn_model.pth')
     
-    # 7. 对清洗训练数据进行预测并回填结果
-    print("\n" + "=" * 60)
-    print("对清洗训练数据进行预测并回填结果")
-    print("=" * 60)
-    cleaned_train_path = 'train/清洗训练数据.csv'
-    if os.path.exists(cleaned_train_path):
-        df_train_cleaned = pd.read_csv(cleaned_train_path)
-        print(f"加载清洗训练数据: {df_train_cleaned.shape}")
-        
-        # 准备特征
-        exclude_cols = ['time', 'group_name', 'sufficient_window_size',
-                        'labelMovement', 'result', 'labelArea']
-        feature_cols = [col for col in df_train_cleaned.columns if col not in exclude_cols]
-        
-        if cleaner.feature_columns is not None:
-            feature_cols = [col for col in cleaner.feature_columns if col in feature_cols]
-            X_train_for_predict = df_train_cleaned[feature_cols].copy()
-            missing_cols = set(cleaner.feature_columns) - set(feature_cols)
-            if missing_cols:
-                print(f"警告: 训练数据缺少特征列: {len(missing_cols)} 个")
-                for col in missing_cols:
-                    X_train_for_predict[col] = 0
-            X_train_for_predict = X_train_for_predict[cleaner.feature_columns]
-        else:
-            X_train_for_predict = df_train_cleaned[feature_cols].copy()
-        
-        # 标准化
-        X_train_scaled = cleaner.transform_features(X_train_for_predict.values, is_train=False)
-        
-        # 构建图并预测
-        train_graphs = trainer.build_graphs_from_data(X_train_scaled, 
-                                                       np.zeros(len(X_train_scaled)))
-        
-        # 预测
-        trainer.model.eval()
-        predictions = []
-        with torch.no_grad():
-            for i in range(0, len(train_graphs), trainer.batch_size):
-                batch_graphs = train_graphs[i:i+trainer.batch_size]
-                batch = Batch.from_data_list(batch_graphs)
-                out = trainer.model(batch.x, batch.edge_index, batch.batch)
-                pred = out.argmax(dim=1).cpu().numpy()
-                predictions.extend(pred)
-        
-        # 将预测结果映射回原始样本
-        final_predictions = np.zeros(len(df_train_cleaned), dtype=int)
-        window_size = trainer.graph_builder.window_size
-        
-        # 前window_size-1个样本使用第一个预测
-        if len(predictions) > 0:
-            final_predictions[:window_size-1] = predictions[0]
-            
-            # 后续样本使用对应预测
-            for i in range(window_size-1, len(df_train_cleaned)):
-                seq_idx = i - (window_size - 1)
-                if seq_idx < len(predictions):
-                    final_predictions[i] = predictions[seq_idx]
-                else:
-                    final_predictions[i] = predictions[-1]
-        
-        # 回填结果
-        df_train_cleaned['result'] = final_predictions
-        
-        # 保存
-        df_train_cleaned.to_csv(cleaned_train_path, index=False)
-        print(f"清洗训练数据预测结果已回填并保存到: {cleaned_train_path}")
-    
     print("\n" + "=" * 60)
     print("模型训练完成！")
+    print("=" * 60)
+    print("\n提示：")
+    print("  - 模型已保存到: model/gnn_model.pth")
+    print("  - 最佳模型已保存到: model/gnn_model_best.pth")
+    print("  - 请运行 c_模型调用以及结果分析代码.py 进行预测")
     print("=" * 60)
 
 

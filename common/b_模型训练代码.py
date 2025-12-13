@@ -51,12 +51,19 @@ class SVDQRLLDATrainer:
         # 分类阈值（用于调整决策边界）
         self.thresholds = None
         
-    def smote_oversample(self, X, y, k_neighbors=5):
+    def smote_oversample(self, X, y, k_neighbors=7, target_ratio=1.0):
         """
-        SMOTE过采样处理类别不平衡
+        SMOTE过采样处理类别不平衡（优化：完全平衡以提升准确率）
+        
+        Parameters:
+        -----------
+        k_neighbors : int
+            近邻数量（增加到7个以提高合成样本质量）
+        target_ratio : float
+            目标平衡比例（1.0表示完全平衡）
         """
         print("\n" + "=" * 60)
-        print("SMOTE过采样")
+        print("SMOTE过采样（优化版：完全平衡100%）")
         print("=" * 60)
         
         if isinstance(y, pd.Series):
@@ -65,10 +72,12 @@ class SVDQRLLDATrainer:
         # 统计各类别样本数
         unique_classes, class_counts = np.unique(y, return_counts=True)
         max_count = max(class_counts)
+        target_count = int(max_count * target_ratio)  # 目标样本数（完全平衡）
         
         print(f"原始类别分布:")
         for cls, count in zip(unique_classes, class_counts):
             print(f"  类别 {cls}: {count} ({count/len(y)*100:.2f}%)")
+        print(f"目标样本数: {target_count}")
         
         X_resampled = []
         y_resampled = []
@@ -81,11 +90,16 @@ class SVDQRLLDATrainer:
             X_resampled.append(X_cls)
             y_resampled.extend([cls] * n_samples)
             
-            # 如果是少数类，进行过采样
-            if n_samples < max_count * 0.8:  # 少于最大类80%的样本数
-                n_synthetic = int(max_count * 0.8) - n_samples
+            # 如果是少数类，进行过采样到目标数量
+            if n_samples < target_count:
+                n_synthetic = target_count - n_samples
                 
-                # SMOTE合成
+                # 确保有足够的近邻
+                actual_k = min(k_neighbors, n_samples - 1)
+                if actual_k < 1:
+                    actual_k = 1
+                
+                # SMOTE合成（使用更多近邻以提高质量）
                 synthetic_samples = []
                 for _ in range(n_synthetic):
                     # 随机选择一个样本
@@ -94,16 +108,21 @@ class SVDQRLLDATrainer:
                     
                     # 找k个最近邻
                     distances = np.sum((X_cls - sample) ** 2, axis=1)
-                    k_nearest_idx = np.argsort(distances)[1:k_neighbors+1]
+                    k_nearest_idx = np.argsort(distances)[1:actual_k+1]
                     
-                    # 随机选择一个近邻
-                    neighbor_idx = np.random.choice(k_nearest_idx)
-                    neighbor = X_cls[neighbor_idx]
-                    
-                    # 在样本和近邻之间线性插值
-                    alpha = np.random.random()
-                    synthetic = sample + alpha * (neighbor - sample)
-                    synthetic_samples.append(synthetic)
+                    if len(k_nearest_idx) > 0:
+                        # 随机选择一个近邻
+                        neighbor_idx = np.random.choice(k_nearest_idx)
+                        neighbor = X_cls[neighbor_idx]
+                        
+                        # 在样本和近邻之间线性插值（使用更保守的范围）
+                        alpha = np.random.uniform(0.2, 0.8)  # 避免过于接近边界
+                        synthetic = sample + alpha * (neighbor - sample)
+                        synthetic_samples.append(synthetic)
+                    else:
+                        # 如果没有近邻，使用轻微扰动
+                        noise = np.random.normal(0, 0.01, size=sample.shape)
+                        synthetic_samples.append(sample + noise)
                 
                 if synthetic_samples:
                     X_resampled.append(np.array(synthetic_samples))
@@ -403,11 +422,20 @@ class SVDQRLLDATrainer:
         
         return predictions
     
-    def temporal_smoothing(self, predictions, window_size=5):
+    def temporal_smoothing(self, predictions, window_size=9):
         """
-        时序平滑（避免抖动）
+        时序平滑（优化：增加窗口大小到9以提升稳定性，提升准确率）
+        
+        Parameters:
+        -----------
+        window_size : int
+            平滑窗口大小（增加到9以提升稳定性）
         """
         smoothed = np.copy(predictions)
+        
+        # 如果窗口太大，可能导致过度平滑，先检查
+        if window_size > len(predictions):
+            window_size = max(3, len(predictions) // 10)  # 最多使用10%的数据作为窗口
         
         for i in range(len(predictions)):
             start = max(0, i - window_size // 2)
@@ -420,16 +448,18 @@ class SVDQRLLDATrainer:
         
         return smoothed
     
-    def evaluate_model(self, X_test_selected, y_test, use_smoothing=False):
-        """评估模型"""
+    def evaluate_model(self, X_test_selected, y_test, use_smoothing=True):
+        """评估模型（优化：使用类别权重和时序平滑以提升准确率）"""
         print("\n" + "=" * 60)
-        print("模型评估")
+        print("模型评估（优化版）")
         print("=" * 60)
         
-        y_pred = self.predict(X_test_selected)
+        # 使用类别权重，提升少数类识别
+        y_pred = self.predict(X_test_selected, use_threshold=False, use_class_weight=True)
         
+        # 使用适度的时序平滑（窗口大小9，提升稳定性）
         if use_smoothing:
-            y_pred = self.temporal_smoothing(y_pred)
+            y_pred = self.temporal_smoothing(y_pred, window_size=9)
         
         accuracy = np.mean(y_pred == y_test)
         print(f"测试集准确率: {accuracy:.4f} ({accuracy*100:.2f}%)")
@@ -526,29 +556,30 @@ def main():
         output_dir='model/'
     )
     
+    # 优化：使用更多数据训练（从70%提高到85%）
     X_train, X_test, y_train, y_test = cleaner.process_train_data(
         remove_outliers_flag=True,
         fill_missing_flag=True,
         standardize=True,
-        test_size=0.3
+        test_size=0.15  # 降低测试集比例，使用更多数据训练
     )
     
     # 2. 创建改进的训练器
     trainer = SVDQRLLDATrainer(model_dir='model/', random_state=42)
     
-    # 3. SMOTE过采样
-    X_train_balanced, y_train_balanced = trainer.smote_oversample(X_train, y_train)
+    # 3. SMOTE过采样（优化：完全平衡100%，近邻数7）
+    X_train_balanced, y_train_balanced = trainer.smote_oversample(X_train, y_train, target_ratio=1.0, k_neighbors=7)
     
-    # 4. SVD降维（提高到99%）
-    X_train_reduced = trainer.svd_decomposition(X_train_balanced, cumulative_ratio=0.99)
+    # 4. SVD降维（优化：提高到99.5%）
+    X_train_reduced = trainer.svd_decomposition(X_train_balanced, cumulative_ratio=0.995)
     X_test_reduced = trainer.apply_svd_transform(X_test)
     
-    # 5. QR特征筛选（提高到90%）
-    X_train_selected = trainer.qr_feature_selection(X_train_reduced, y_train_balanced, feature_ratio=0.90)
+    # 5. QR特征筛选（优化：提高到95%）
+    X_train_selected = trainer.qr_feature_selection(X_train_reduced, y_train_balanced, feature_ratio=0.95)
     X_test_selected = trainer.apply_qr_selection(X_test_reduced)
     
-    # 6. 改进的LDA求解（多判别向量）
-    trainer.improved_lda_solve(X_train_selected, y_train_balanced, n_components=2)
+    # 6. 改进的LDA求解（优化：增加到3个判别向量，适度正则化防止过拟合）
+    trainer.improved_lda_solve(X_train_selected, y_train_balanced, n_components=3, regularization=5e-4)
     
     # 7. 训练模型
     trainer.train_lda_model(X_train_selected, y_train_balanced)
