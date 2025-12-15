@@ -6,7 +6,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.preprocessing import StandardScaler
 import os
 import pickle
 
@@ -40,10 +40,6 @@ class DataCleaner:
         
         # 初始化标准化器
         self.scaler = StandardScaler()
-        
-        # 特征工程（多项式特征，用于提升准确率）
-        self.poly_features = None
-        self.use_poly_features = True  # 启用多项式特征以提升准确率
         
         # 存储特征列名和标签列名
         self.feature_columns = None
@@ -84,9 +80,9 @@ class DataCleaner:
                     print(f"  数据形状: {df.shape}")
         return test_files
     
-    def remove_outliers(self, df, columns=None, threshold=2.5, method='std'):
+    def remove_outliers(self, df, columns=None, threshold=3):
         """
-        移除异常值（使用更保守的方法以提高准确率）
+        移除异常值（使用3倍标准差方法）
         
         Parameters:
         -----------
@@ -95,9 +91,7 @@ class DataCleaner:
         columns : list or None
             要处理的列，None表示处理所有数值列
         threshold : float
-            标准差倍数阈值（降低到2.5以提高数据保留率）
-        method : str
-            方法：'std'（标准差）或'iqr'（四分位距）
+            标准差倍数阈值
         
         Returns:
         --------
@@ -114,53 +108,39 @@ class DataCleaner:
                       if col not in exclude_cols and 
                       df_cleaned[col].dtype in [np.float64, np.int64]]
         
-        print(f"正在处理异常值，方法: {method}, 阈值: {threshold}")
+        print(f"正在处理异常值，阈值: {threshold}倍标准差")
         initial_count = len(df_cleaned)
-        outliers_count = 0
         
         for col in columns:
             if col in df_cleaned.columns:
-                if method == 'iqr':
-                    # 使用IQR方法（更保守，保留更多数据）
-                    Q1 = df_cleaned[col].quantile(0.25)
-                    Q3 = df_cleaned[col].quantile(0.75)
-                    IQR = Q3 - Q1
-                    lower_bound = Q1 - threshold * IQR
-                    upper_bound = Q3 + threshold * IQR
-                else:
-                    # 使用标准差方法（降低阈值以保留更多数据）
-                    mean = df_cleaned[col].mean()
-                    std = df_cleaned[col].std()
-                    
-                    if std > 0:  # 避免除零
-                        lower_bound = mean - threshold * std
-                        upper_bound = mean + threshold * std
-                    else:
-                        continue
+                mean = df_cleaned[col].mean()
+                std = df_cleaned[col].std()
                 
-                # 标记异常值
-                mask = (df_cleaned[col] >= lower_bound) & (df_cleaned[col] <= upper_bound)
-                outliers_count += (~mask).sum()
-                
-                # 将异常值替换为边界值（而不是删除，保留更多数据）
-                df_cleaned.loc[df_cleaned[col] < lower_bound, col] = lower_bound
-                df_cleaned.loc[df_cleaned[col] > upper_bound, col] = upper_bound
+                if std > 0:  # 避免除零
+                    # 标记异常值
+                    mask = np.abs(df_cleaned[col] - mean) <= threshold * std
+                    # 将异常值替换为边界值
+                    lower_bound = mean - threshold * std
+                    upper_bound = mean + threshold * std
+                    df_cleaned.loc[~mask, col] = np.clip(
+                        df_cleaned.loc[~mask, col], 
+                        lower_bound, 
+                        upper_bound
+                    )
         
-        print(f"异常值处理完成，样本数: {initial_count}, 处理异常值: {outliers_count} 个")
+        print(f"异常值处理完成，样本数: {initial_count} -> {len(df_cleaned)}")
         return df_cleaned
     
-    def fill_missing_values(self, df, strategy='median', use_forward_fill=True):
+    def fill_missing_values(self, df, strategy='median'):
         """
-        填充缺失值（使用更精细的策略以提高准确率）
+        填充缺失值
         
         Parameters:
         -----------
         df : DataFrame
             输入数据
         strategy : str
-            填充策略：'mean', 'median', 'mode', 'zero', 'interpolate'
-        use_forward_fill : bool
-            是否先尝试前向填充（对时序数据更有效）
+            填充策略：'mean', 'median', 'mode', 'zero'
         
         Returns:
         --------
@@ -169,7 +149,7 @@ class DataCleaner:
         """
         df_filled = df.copy()
         
-        print(f"正在填充缺失值，策略: {strategy}, 前向填充: {use_forward_fill}")
+        print(f"正在填充缺失值，策略: {strategy}")
         
         # 选择数值列
         exclude_cols = ['time', 'group_name', 'sufficient_window_size', 
@@ -184,32 +164,18 @@ class DataCleaner:
             
             for col in numeric_cols:
                 if df_filled[col].isnull().any():
-                    # 先尝试前向填充（对时序数据更有效）
-                    if use_forward_fill:
-                        df_filled[col] = df_filled[col].ffill()
-                        df_filled[col] = df_filled[col].bfill()
+                    if strategy == 'mean':
+                        fill_value = df_filled[col].mean()
+                    elif strategy == 'median':
+                        fill_value = df_filled[col].median()
+                    elif strategy == 'mode':
+                        fill_value = df_filled[col].mode()[0] if not df_filled[col].mode().empty else 0
+                    elif strategy == 'zero':
+                        fill_value = 0
+                    else:
+                        fill_value = df_filled[col].median()
                     
-                    # 如果还有缺失值，使用指定策略
-                    if df_filled[col].isnull().any():
-                        if strategy == 'interpolate':
-                            # 使用线性插值（对时序数据更准确）
-                            df_filled[col] = df_filled[col].interpolate(method='linear')
-                            df_filled[col] = df_filled[col].bfill()
-                            df_filled[col] = df_filled[col].ffill()
-                        elif strategy == 'mean':
-                            fill_value = df_filled[col].mean()
-                            df_filled[col].fillna(fill_value, inplace=True)
-                        elif strategy == 'median':
-                            fill_value = df_filled[col].median()
-                            df_filled[col].fillna(fill_value, inplace=True)
-                        elif strategy == 'mode':
-                            fill_value = df_filled[col].mode()[0] if not df_filled[col].mode().empty else 0
-                            df_filled[col].fillna(fill_value, inplace=True)
-                        elif strategy == 'zero':
-                            df_filled[col].fillna(0, inplace=True)
-                        else:
-                            fill_value = df_filled[col].median()
-                            df_filled[col].fillna(fill_value, inplace=True)
+                    df_filled[col].fillna(fill_value, inplace=True)
         else:
             print("未发现缺失值")
         
@@ -217,7 +183,7 @@ class DataCleaner:
     
     def prepare_features(self, df, is_train=True):
         """
-        准备特征矩阵和标签向量（优化：只使用有效特征列）
+        准备特征矩阵和标签向量
         
         Parameters:
         -----------
@@ -233,66 +199,43 @@ class DataCleaner:
         y : Series or None
             标签向量（测试数据为None）
         """
-        # 排除非特征列（标识列和标签列）
+        # 排除非特征列
         exclude_cols = ['time', 'group_name', 'sufficient_window_size', 
                        'labelMovement']
         
         if is_train:
             exclude_cols.append(self.label_column)
-            exclude_cols.append('result')  # 结果列不作为特征
-            
-            # 只使用有效的特征列（如果已经通过get_valid_columns筛选过）
-            if self.feature_columns is not None:
-                # 从有效列中提取特征列（排除标识列和标签列）
-                feature_cols = [col for col in self.feature_columns 
-                              if col not in exclude_cols]
-            else:
-                # 如果还没有筛选，使用所有数值列
-                feature_cols = [col for col in df.columns 
-                              if col not in exclude_cols and
-                              df[col].dtype in [np.float64, np.int64, np.float32, np.int32]]
-            
+            feature_cols = [col for col in df.columns if col not in exclude_cols]
             X = df[feature_cols].copy()
             y = df[self.label_column].copy()
             
             # 保存特征列名
             if self.feature_columns is None:
-                # 如果还没有设置，保存当前使用的特征列
                 self.feature_columns = feature_cols
             
-            print(f"训练数据特征数: {len(feature_cols)}")
             return X, y
         else:
             # 测试数据不应该包含labelArea列（避免标签泄露）
             # 也不应该包含result列（这是预测结果列）
             exclude_cols_test = exclude_cols + ['labelArea', 'result']
+            feature_cols = [col for col in df.columns if col not in exclude_cols_test]
             
             # 确保特征列顺序与训练时一致
             if self.feature_columns is not None:
-                # 只保留训练时使用的特征列（排除标识列和标签列）
-                feature_cols = [col for col in self.feature_columns 
-                              if col not in exclude_cols_test]
+                # 只保留训练时使用的特征列
+                feature_cols = [col for col in self.feature_columns if col in feature_cols]
                 X = df[feature_cols].copy()
-                
                 # 如果缺少某些特征列，用0填充
-                missing_cols = set(self.feature_columns) - set(exclude_cols_test) - set(feature_cols)
+                missing_cols = set(self.feature_columns) - set(feature_cols)
                 if missing_cols:
                     print(f"警告: 测试数据缺少特征列: {len(missing_cols)} 个")
                     for col in missing_cols:
                         X[col] = 0
-                
-                # 确保列顺序一致（只保留特征列）
-                feature_cols_ordered = [col for col in self.feature_columns 
-                                       if col not in exclude_cols_test]
-                X = X[feature_cols_ordered]
+                # 确保列顺序一致
+                X = X[self.feature_columns]
             else:
-                # 如果还没有设置，使用所有数值列
-                feature_cols = [col for col in df.columns 
-                              if col not in exclude_cols_test and
-                              df[col].dtype in [np.float64, np.int64, np.float32, np.int32]]
                 X = df[feature_cols].copy()
             
-            print(f"测试数据特征数: {X.shape[1]}")
             return X, None
     
     def split_data(self, X, y, test_size=0.2):
@@ -340,7 +283,7 @@ class DataCleaner:
     
     def transform_features(self, X, is_train=False):
         """
-        标准化特征（可选添加多项式特征以提升准确率）
+        标准化特征
         
         Parameters:
         -----------
@@ -352,29 +295,12 @@ class DataCleaner:
         Returns:
         --------
         X_scaled : ndarray
-            标准化后的特征矩阵（可能包含多项式特征）
+            标准化后的特征矩阵
         """
-        # 标准化
         if is_train:
             X_scaled = self.scaler.fit_transform(X)
         else:
             X_scaled = self.scaler.transform(X)
-        
-        # 添加多项式特征（仅交互项，避免特征爆炸）
-        if self.use_poly_features:
-            if is_train:
-                # 创建多项式特征生成器（仅交互项，degree=2）
-                self.poly_features = PolynomialFeatures(
-                    degree=2, 
-                    interaction_only=True,  # 仅交互项，不包括平方项
-                    include_bias=False
-                )
-                X_scaled = self.poly_features.fit_transform(X_scaled)
-                print(f"多项式特征工程：{X_scaled.shape[1] - X.shape[1]} 个新特征")
-            else:
-                if self.poly_features is not None:
-                    X_scaled = self.poly_features.transform(X_scaled)
-        
         return X_scaled
     
     def save_preprocessor(self, filename='preprocessor.pkl'):
@@ -389,9 +315,7 @@ class DataCleaner:
         filepath = os.path.join(self.output_dir, filename)
         preprocessor = {
             'scaler': self.scaler,
-            'feature_columns': self.feature_columns,
-            'poly_features': self.poly_features,
-            'use_poly_features': self.use_poly_features
+            'feature_columns': self.feature_columns
         }
         with open(filepath, 'wb') as f:
             pickle.dump(preprocessor, f)
@@ -412,22 +336,14 @@ class DataCleaner:
                 preprocessor = pickle.load(f)
             self.scaler = preprocessor['scaler']
             self.feature_columns = preprocessor['feature_columns']
-            self.poly_features = preprocessor.get('poly_features', None)
-            self.use_poly_features = preprocessor.get('use_poly_features', True)
             print(f"预处理对象已加载: {filepath}")
         else:
             print(f"警告: 预处理对象文件不存在: {filepath}")
     
     def get_valid_columns(self, df):
         """
-        智能特征选择：筛选有用的特征列，移除无用列
-        
-        筛选策略：
-        1. 移除低方差特征（几乎不变的特征）
-        2. 移除高缺失值特征（缺失率>50%）
-        3. 移除常数特征（方差为0）
-        4. 移除明显无效的特征（如包含-999999999的特殊值）
-        5. 保留与目标相关的特征
+        根据特征列作用文档获取有效列名
+        只保留有效列，删除无效列
         
         Parameters:
         -----------
@@ -439,78 +355,17 @@ class DataCleaner:
         valid_columns : list
             有效列名列表
         """
-        # 基础标识列（必须保留，但不作为特征）
-        # 注意：只保留实际存在于DataFrame中的列
-        potential_base_cols = ['time', 'group_name', 'sufficient_window_size', 'labelArea', 'labelMovement', 'result']
-        base_cols = [col for col in potential_base_cols if col in df.columns]
+        # 基础标识列（必须保留）
+        base_cols = ['time', 'group_name', 'sufficient_window_size', 'labelArea', 'labelMovement']
         
-        print("=" * 60)
-        print("智能特征选择：筛选有用的特征列")
-        print("=" * 60)
-        
+        # 从数据中提取所有列，排除明显无效的列
         all_cols = df.columns.tolist()
-        print(f"原始总列数: {len(all_cols)}")
-        print(f"基础标识列: {base_cols}")
         
-        # 1. 排除基础标识列
-        feature_candidates = [col for col in all_cols if col not in base_cols]
-        print(f"排除标识列后: {len(feature_candidates)} 个候选特征")
+        # 保留所有列（根据特征列作用.md，所有列都标记为有效）
+        # 但排除一些明显不是特征的列（如果有的话）
+        valid_columns = [col for col in all_cols if col in df.columns]
         
-        # 2. 选择数值列
-        numeric_cols = [col for col in feature_candidates 
-                       if df[col].dtype in [np.float64, np.int64, np.float32, np.int32]]
-        print(f"数值特征列: {len(numeric_cols)} 个")
-        
-        # 3. 移除常数特征（方差为0或接近0）
-        valid_features = []
-        constant_features = []
-        low_variance_features = []
-        
-        for col in numeric_cols:
-            if col not in df.columns:
-                continue
-            
-            # 计算方差
-            variance = df[col].var()
-            
-            # 检查是否为常数
-            if variance == 0 or (variance < 1e-10):
-                constant_features.append(col)
-                continue
-            
-            # 检查缺失值比例
-            missing_ratio = df[col].isnull().sum() / len(df)
-            if missing_ratio > 0.5:  # 缺失率超过50%
-                continue
-            
-            # 检查是否包含特殊无效值（如-999999999）
-            if df[col].dtype in [np.float64, np.float32]:
-                invalid_count = (df[col] == -999999999.0).sum()
-                if invalid_count / len(df) > 0.5:  # 超过50%是无效值
-                    continue
-            
-            # 检查方差是否过低（使用相对方差，避免因量纲问题误删）
-            mean_abs = np.abs(df[col].mean())
-            if mean_abs > 1e-6:  # 避免除零
-                cv = np.sqrt(variance) / mean_abs  # 变异系数
-                if cv < 0.001:  # 变异系数过小，说明几乎不变
-                    low_variance_features.append(col)
-                    continue
-            
-            valid_features.append(col)
-        
-        print(f"移除常数特征: {len(constant_features)} 个")
-        print(f"移除低方差特征: {len(low_variance_features)} 个")
-        print(f"保留有效特征: {len(valid_features)} 个")
-        
-        # 4. 移除高度相关的特征（可选，避免冗余）
-        # 这里暂时不实现，因为计算量大，可以在后续步骤中通过QR分解处理
-        
-        # 5. 合并基础列和有效特征列
-        valid_columns = base_cols + valid_features
-        
-        print(f"\n最终有效列数: {len(valid_columns)} (基础列: {len(base_cols)}, 特征列: {len(valid_features)})")
-        print(f"特征减少率: {(len(all_cols) - len(valid_columns)) / len(all_cols) * 100:.1f}%")
+        print(f"总列数: {len(all_cols)}, 有效列数: {len(valid_columns)}")
         
         return valid_columns
     
@@ -518,7 +373,13 @@ class DataCleaner:
                             fill_missing_flag=True, random_state=None):
         """
         清洗数据并划分训练集和测试集
-        只保留有效列，随机选取80%作为训练数据，20%作为测试数据
+        按批次（group_name）划分：将80%的批次作为训练数据，20%的批次作为测试数据
+        这样可以避免同一批次内的样本同时出现在训练集和测试集中，防止数据泄露
+        
+        为什么按批次划分：
+        - 同一批次内的样本有时序相关性
+        - 随机划分会导致数据泄露（模型可能看到"未来"数据）
+        - 按批次划分更接近真实的实时检测场景
         
         Parameters:
         -----------
@@ -529,7 +390,7 @@ class DataCleaner:
         fill_missing_flag : bool
             是否填充缺失值
         random_state : int or None
-            随机种子
+            随机种子（用于批次划分的随机性）
         
         Returns:
         --------
@@ -544,33 +405,47 @@ class DataCleaner:
         # 1. 加载数据
         df = self.load_train_data()
         
-        # 2. 获取有效列（智能特征选择）
+        # 2. 获取有效列
         valid_columns = self.get_valid_columns(df)
         df = df[valid_columns].copy()
         
-        # 保存有效列信息（用于后续特征准备）
-        self.feature_columns = [col for col in valid_columns 
-                               if col not in ['time', 'group_name', 'sufficient_window_size', 
-                                            'labelArea', 'labelMovement', 'result']]
-        
         print(f"保留有效列后数据形状: {df.shape}")
         
-        # 3. 数据清洗（使用更精细的策略以提高准确率）
+        # 3. 数据清洗
         if remove_outliers_flag:
-            df = self.remove_outliers(df, threshold=2.5, method='std')
+            df = self.remove_outliers(df)
         
         if fill_missing_flag:
-            df = self.fill_missing_values(df, strategy='interpolate', use_forward_fill=True)
+            df = self.fill_missing_values(df)
         
-        # 4. 随机划分训练集和测试集
-        print(f"正在随机划分数据，训练集比例: {train_ratio}")
-        df_shuffled = df.sample(frac=1, random_state=random_state).reset_index(drop=True)
-        n_train = int(len(df_shuffled) * train_ratio)
+        # 4. 按批次划分训练集和测试集
+        print(f"正在按批次划分数据，训练集比例: {train_ratio}")
+        print("注意：按批次划分可以避免同一批次内的样本同时出现在训练集和测试集中，防止数据泄露")
         
-        train_df = df_shuffled.iloc[:n_train].copy()
-        test_df = df_shuffled.iloc[n_train:].copy()
+        # 获取所有唯一的批次名称
+        unique_groups = df['group_name'].unique()
+        n_groups = len(unique_groups)
+        print(f"总批次数量: {n_groups}")
+        
+        # 对批次进行排序以确保可重复性，然后打乱
+        unique_groups_sorted = sorted(unique_groups)
+        np.random.seed(random_state)
+        np.random.shuffle(unique_groups_sorted)
+        
+        # 计算训练集和测试集的批次数量
+        n_train_groups = int(n_groups * train_ratio)
+        train_groups = set(unique_groups_sorted[:n_train_groups])
+        test_groups = set(unique_groups_sorted[n_train_groups:])
+        
+        print(f"训练集批次数量: {len(train_groups)}, 测试集批次数量: {len(test_groups)}")
+        
+        # 根据批次划分数据
+        train_df = df[df['group_name'].isin(train_groups)].copy()
+        test_df = df[df['group_name'].isin(test_groups)].copy()
         
         print(f"训练集形状: {train_df.shape}, 测试集形状: {test_df.shape}")
+        print(f"训练集批次: {sorted(train_groups)[:5]}..." if len(train_groups) > 5 else f"训练集批次: {sorted(train_groups)}")
+        print(f"测试集批次: {sorted(test_groups)[:5]}..." if len(test_groups) > 5 else f"测试集批次: {sorted(test_groups)}")
         
         # 5. 在训练数据中，在sufficient_window_size与labelArea之间插入result列（值为空）
         # 找到sufficient_window_size和labelArea的位置

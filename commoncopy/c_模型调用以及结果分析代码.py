@@ -87,9 +87,9 @@ class ModelPredictor:
         prediction = self.trainer.predict(X_selected, use_threshold=False)[0]
         return prediction
     
-    def predict_batch(self, X_batch, use_threshold=True):
+    def predict_batch(self, X_batch, use_threshold=True, use_ensemble=False):
         """
-        批量预测
+        批量预测（优化版：支持集成预测）
         
         Parameters:
         -----------
@@ -97,6 +97,8 @@ class ModelPredictor:
             批量特征矩阵
         use_threshold : bool
             是否使用阈值调整（默认True）
+        use_ensemble : bool
+            是否使用集成预测（默认False，可设置为True以提高准确率）
         
         Returns:
         --------
@@ -115,14 +117,20 @@ class ModelPredictor:
         # QR特征筛选
         X_selected = self.trainer.apply_qr_selection(X_reduced)
         
-        # 预测（使用阈值调整）
-        predictions = self.trainer.predict(X_selected, use_threshold=use_threshold)
+        # 预测（使用阈值调整和集成预测）
+        predictions = self.trainer.predict(
+            X_selected, 
+            use_threshold=use_threshold,
+            use_ensemble=use_ensemble,
+            n_ensemble=5
+        )
         return predictions
     
     def predict_test_file(self, cleaned_test_path='train/清洗测试数据.csv', 
                           output_path=None):
         """
         对清洗测试数据进行预测，并将结果填入result列
+        注意：不读取labelArea列用于预测，但保留在文件中
         
         Parameters:
         -----------
@@ -131,52 +139,69 @@ class ModelPredictor:
         output_path : str or None
             输出文件路径，None则覆盖原文件（不创建新文件）
         """
+        print(f"正在处理测试文件: {cleaned_test_path}")
+        
         if not os.path.exists(cleaned_test_path):
             raise FileNotFoundError(f"文件不存在: {cleaned_test_path}")
         
-        # 加载数据
+        # 加载测试数据（完整加载，包括labelArea列，但不用于预测）
         df_test = pd.read_csv(cleaned_test_path)
-        print(f"测试数据形状: {df_test.shape}")
+        original_shape = df_test.shape
         
-        # 准备特征（排除result和labelArea列）
-        exclude_cols = ['time', 'group_name', 'sufficient_window_size', 
-                       'labelMovement', 'result', 'labelArea']
-        feature_cols = [col for col in df_test.columns if col not in exclude_cols]
+        # 保存labelArea列（如果存在），但不用于预测
+        labelArea_col = None
+        if 'labelArea' in df_test.columns:
+            labelArea_col = df_test['labelArea'].copy()
+            print("注意: 检测到labelArea列，将保留在文件中但不用于预测")
         
-        # 确保特征列顺序与训练时一致
-        if self.cleaner.feature_columns is not None:
-            feature_cols = [col for col in self.cleaner.feature_columns if col in feature_cols]
-            X_test = df_test[feature_cols].copy()
-            # 如果缺少某些特征列，用0填充
-            missing_cols = set(self.cleaner.feature_columns) - set(feature_cols)
-            if missing_cols:
-                print(f"警告: 测试数据缺少特征列: {len(missing_cols)} 个，将用0填充")
-                for col in missing_cols:
-                    X_test[col] = 0
-            X_test = X_test[self.cleaner.feature_columns]
-        else:
-            X_test = df_test[feature_cols].copy()
+        # 检查是否有result列
+        has_result_col = 'result' in df_test.columns
         
-        # 预测
-        print("正在预测...")
+        # 数据清洗和预处理（process_test_data会自动排除labelArea列）
+        X_test = self.cleaner.process_test_data(df_test)
+        
+        # 调试信息：检查特征维度
+        print(f"预处理后特征形状: {X_test.shape}")
+        
+        # 预测（使用集成预测以提高准确率）
+        print("正在预测（使用集成预测以提高准确率）...")
         start_time = time.time()
-        predictions = self.predict_batch(X_test.values)
+        predictions = self.predict_batch(X_test, use_threshold=True, use_ensemble=True)
         predict_time = time.time() - start_time
         
         print(f"预测完成，耗时: {predict_time:.2f} 秒")
+        
+        # 检查预测结果
+        unique_preds, counts = np.unique(predictions, return_counts=True)
+        print(f"预测结果分布: {dict(zip(unique_preds, counts))}")
         print(f"预测类别分布:\n{pd.Series(predictions).value_counts().sort_index()}")
         
-        # 回填到result列
-        df_test['result'] = predictions
+        # 将预测结果写入result列（保留所有原始列，包括labelArea）
+        df_result = df_test.copy()
+        df_result['result'] = predictions
         
-        # 保存结果（覆盖原文件，不创建新文件）
+        # 如果原来没有result列，调整列顺序（在sufficient_window_size之后）
+        if not has_result_col:
+            cols = df_result.columns.tolist()
+            # 移除result列
+            cols.remove('result')
+            if 'sufficient_window_size' in cols:
+                sufficient_idx = cols.index('sufficient_window_size')
+                cols.insert(sufficient_idx + 1, 'result')
+                df_result = df_result.reindex(columns=cols)
+        
+        # 保存结果（包含labelArea列，如果存在）
         if output_path is None:
             output_path = cleaned_test_path
         
-        df_test.to_csv(output_path, index=False, encoding='utf-8-sig')
-        print(f"预测结果已填入并保存到: {output_path}")
+        df_result.to_csv(output_path, index=False, encoding='utf-8-sig')
         
-        return df_test
+        print(f"预测完成: {original_shape[0]} 个样本")
+        print(f"结果已保存到: {output_path}")
+        if labelArea_col is not None:
+            print("注意: labelArea列已保留在输出文件中")
+        
+        return df_result
     
     def predict_validation_files(self, validation_dir='test/', 
                                  output_results_dir='results/validation_predictions/'):
